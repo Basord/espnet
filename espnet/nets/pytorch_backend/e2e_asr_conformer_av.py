@@ -22,6 +22,7 @@ from espnet.nets.pytorch_backend.nets_utils import MLPHead
 
 class E2E(torch.nn.Module):
     def __init__(self, odim, args, ignore_id=-1):
+        print(f"E2E init args: {args}")
         torch.nn.Module.__init__(self)
 
         self.encoder = Encoder(
