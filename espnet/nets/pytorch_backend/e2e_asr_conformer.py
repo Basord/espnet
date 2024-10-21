@@ -1,62 +1,29 @@
-# Copyright 2020 Johns Hopkins University (Shinji Watanabe)
-#                Northwestern Polytechnical University (Pengcheng Guo)
+# Copyright 2019 Shigeki Karita
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-"""
-Conformer speech recognition model (pytorch).
+"""Transformer speech recognition model (pytorch)."""
 
-It is a fusion of `e2e_asr_transformer.py`
-Refer to: https://arxiv.org/abs/2005.08100
+import logging
+import numpy
+import torch
 
-"""
-
-from espnet.nets.pytorch_backend.conformer.argument import (  # noqa: H301
-    add_arguments_conformer_common,
-    verify_rel_pos_type,
+from espnet.nets.pytorch_backend.ctc import CTC
+from espnet.nets.pytorch_backend.nets_utils import (
+    make_non_pad_mask,
+    th_accuracy,
 )
-from espnet.nets.pytorch_backend.conformer.encoder import Encoder
-from espnet.nets.pytorch_backend.e2e_asr_transformer import E2E as E2ETransformer
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
+from espnet.nets.pytorch_backend.transformer.decoder import Decoder
+from espnet.nets.pytorch_backend.transformer.encoder import Encoder
+from espnet.nets.pytorch_backend.transformer.label_smoothing_loss import LabelSmoothingLoss
+from espnet.nets.pytorch_backend.transformer.mask import target_mask
 
 
-class E2E(E2ETransformer):
-    """E2E module.
-
-    :param int idim: dimension of inputs
-    :param int odim: dimension of outputs
-    :param Namespace args: argument Namespace containing options
-
-    """
-
-    @staticmethod
-    def add_arguments(parser):
-        """Add arguments."""
-        E2ETransformer.add_arguments(parser)
-        E2E.add_conformer_arguments(parser)
-        return parser
-
-    @staticmethod
-    def add_conformer_arguments(parser):
-        """Add arguments for conformer model."""
-        group = parser.add_argument_group("conformer model specific setting")
-        group = add_arguments_conformer_common(group)
-        return parser
-
-    def __init__(self, idim, odim, args, ignore_id=-1):
-        """Construct an E2E object.
-
-        :param int idim: dimension of inputs
-        :param int odim: dimension of outputs
-        :param Namespace args: argument Namespace containing options
-        """
-        super().__init__(idim, odim, args, ignore_id)
-        if args.transformer_attn_dropout_rate is None:
-            args.transformer_attn_dropout_rate = args.dropout_rate
-
-        # Check the relative positional encoding type
-        args = verify_rel_pos_type(args)
+class E2E(torch.nn.Module):
+    def __init__(self, odim, args, ignore_id=-1):
+        torch.nn.Module.__init__(self)
 
         self.encoder = Encoder(
-            idim=idim,
             attention_dim=args.adim,
             attention_heads=args.aheads,
             linear_units=args.eunits,
@@ -65,16 +32,81 @@ class E2E(E2ETransformer):
             dropout_rate=args.dropout_rate,
             positional_dropout_rate=args.dropout_rate,
             attention_dropout_rate=args.transformer_attn_dropout_rate,
-            pos_enc_layer_type=args.transformer_encoder_pos_enc_layer_type,
-            selfattention_layer_type=args.transformer_encoder_selfattn_layer_type,
-            activation_type=args.transformer_encoder_activation_type,
+            encoder_attn_layer_type=args.transformer_encoder_attn_layer_type,
             macaron_style=args.macaron_style,
             use_cnn_module=args.use_cnn_module,
-            zero_triu=args.zero_triu,
             cnn_module_kernel=args.cnn_module_kernel,
-            stochastic_depth_rate=args.stochastic_depth_rate,
-            intermediate_layers=self.intermediate_ctc_layers,
-            ctc_softmax=self.ctc.softmax if args.self_conditioning else None,
-            conditioning_layer_dim=odim,
+            zero_triu=getattr(args, "zero_triu", False),
+            a_upsample_ratio=args.a_upsample_ratio,
+            relu_type=getattr(args, "relu_type", "swish"),
         )
-        self.reset_parameters(args)
+
+        self.transformer_input_layer = args.transformer_input_layer
+        self.a_upsample_ratio = args.a_upsample_ratio
+
+        self.proj_decoder = None
+        if args.adim != args.ddim:
+            self.proj_decoder = torch.nn.Linear(args.adim, args.ddim)
+
+        if args.mtlalpha < 1:
+            self.decoder = Decoder(
+                odim=odim,
+                attention_dim=args.ddim,
+                attention_heads=args.dheads,
+                linear_units=args.dunits,
+                num_blocks=args.dlayers,
+                dropout_rate=args.dropout_rate,
+                positional_dropout_rate=args.dropout_rate,
+                self_attention_dropout_rate=args.transformer_attn_dropout_rate,
+                src_attention_dropout_rate=args.transformer_attn_dropout_rate,
+            )
+        else:
+            self.decoder = None
+        self.blank = 0
+        self.sos = odim - 1
+        self.eos = odim - 1
+        self.odim = odim
+        self.ignore_id = ignore_id
+
+        # self.lsm_weight = a
+        self.criterion = LabelSmoothingLoss(
+            self.odim,
+            self.ignore_id,
+            args.lsm_weight,
+            args.transformer_length_normalized_loss,
+        )
+
+        self.adim = args.adim
+        self.mtlalpha = args.mtlalpha
+        if args.mtlalpha > 0.0:
+            self.ctc = CTC(
+                odim, args.adim, args.dropout_rate, ctc_type=args.ctc_type, reduce=True
+            )
+        else:
+            self.ctc = None
+
+    def forward(self, x, lengths, label):
+        if self.transformer_input_layer == "conv1d":
+            lengths = torch.div(lengths, 640, rounding_mode="trunc")
+        padding_mask = make_non_pad_mask(lengths).to(x.device).unsqueeze(-2)
+
+        x, _ = self.encoder(x, padding_mask)
+
+        # ctc loss
+        loss_ctc, ys_hat = self.ctc(x, lengths, label)
+
+        if self.proj_decoder:
+            x = self.proj_decoder(x)
+
+        # decoder loss
+        ys_in_pad, ys_out_pad = add_sos_eos(label, self.sos, self.eos, self.ignore_id)
+        ys_mask = target_mask(ys_in_pad, self.ignore_id)
+        pred_pad, _ = self.decoder(ys_in_pad, ys_mask, x, padding_mask)
+        loss_att = self.criterion(pred_pad, ys_out_pad)
+        loss = self.mtlalpha * loss_ctc + (1 - self.mtlalpha) * loss_att
+
+        acc = th_accuracy(
+            pred_pad.view(-1, self.odim), ys_out_pad, ignore_label=self.ignore_id
+        )
+
+        return loss, loss_ctc, loss_att, acc
