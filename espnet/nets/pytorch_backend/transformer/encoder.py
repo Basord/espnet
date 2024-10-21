@@ -92,6 +92,7 @@ class Encoder(torch.nn.Module):
         relu_type="prelu",
         a_upsample_ratio=1,
     ):
+        print(f"Encoder init params: input_layer={input_layer}")
         """Construct an Encoder object."""
         super(Encoder, self).__init__()
         self._register_load_state_dict_pre_hook(_pre_hook)
