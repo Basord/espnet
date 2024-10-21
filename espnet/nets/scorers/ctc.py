@@ -49,7 +49,7 @@ class CTCPrefixScorer(BatchPartialScorerInterface):
             state: pruned state
 
         """
-        if type(state) is tuple:
+        if type(state) == tuple:
             if len(state) == 2:  # for CTCPrefixScore
                 sc, st = state
                 return sc[i], st[i]
